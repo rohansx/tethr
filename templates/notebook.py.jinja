@@ -1,0 +1,109 @@
+"""tethr boot script — rendered and pushed into a kaggle kernel by `tethr up`.
+
+talks to the cli through exactly two channels: kaggle secrets in, marker
+lines out (see docs/tech-spec.md#notebook-contract). do not parse this
+script's own stdout for anything other than the TETHR_* markers below --
+llama.cpp and cloudflared's raw output are not a stable contract.
+"""
+
+import os
+import re
+import subprocess
+import tarfile
+import time
+from pathlib import Path
+
+MODEL_PATH = "/kaggle/input/{{ model_dataset_slug }}/{{ model_filename }}"
+BINARY_DATASET = "/kaggle/input/{{ binary_dataset_slug }}"
+WORKDIR = Path("/kaggle/working/tethr")
+LLAMA_PORT = 8080
+CTX_SIZE = {{ ctx_size }}
+TUNNEL_MODE = "{{ tunnel_mode }}"  # quick | named
+
+API_KEY = os.environ["TETHR_API_KEY"]
+
+
+def log_marker(name: str, value: str) -> None:
+    print(f"TETHR_{name}::{value}", flush=True)
+
+
+def step_1_unpack_binary() -> Path:
+    WORKDIR.mkdir(parents=True, exist_ok=True)
+    tar_path = next(Path(BINARY_DATASET).glob("*.tar*"))
+    with tarfile.open(tar_path) as tar:
+        tar.extractall(WORKDIR)
+    binary = WORKDIR / "llama-server"
+    binary.chmod(0o755)
+    return binary
+
+
+def step_2_launch_llama_server(binary: Path) -> subprocess.Popen:
+    cmd = [
+        str(binary),
+        "-m", MODEL_PATH,
+        "-ngl", "999",
+        "-c", str(CTX_SIZE),
+        "--host", "127.0.0.1",
+        "--port", str(LLAMA_PORT),
+        "--api-key", API_KEY,
+        "--jinja",
+    ]
+    env = os.environ | {"LD_LIBRARY_PATH": str(WORKDIR)}
+    return subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def step_3_wait_for_health() -> None:
+    import httpx
+
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        try:
+            r = httpx.get(f"http://127.0.0.1:{LLAMA_PORT}/health", timeout=5)
+            if r.status_code == 200:
+                return
+        except httpx.HTTPError:
+            pass
+        time.sleep(2)
+    raise RuntimeError("llama-server did not become healthy in time")
+
+
+def step_4_start_tunnel() -> str:
+    if TUNNEL_MODE == "named":
+        token = os.environ["TETHR_TUNNEL_TOKEN"]
+        subprocess.Popen(["cloudflared", "tunnel", "run", "--token", token])
+        return "{{ tunnel_hostname }}"
+
+    proc = subprocess.Popen(
+        ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{LLAMA_PORT}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    pattern = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+    for line in proc.stdout:
+        match = pattern.search(line)
+        if match:
+            return match.group(0)
+    raise RuntimeError("quick tunnel url never appeared in cloudflared output")
+
+
+def step_5_heartbeat() -> None:
+    while True:
+        log_marker("HEARTBEAT", str(int(time.time())))
+        time.sleep(60)
+
+
+def main() -> None:
+    try:
+        binary = step_1_unpack_binary()
+        step_2_launch_llama_server(binary)
+        step_3_wait_for_health()
+        url = step_4_start_tunnel()
+        log_marker("URL", url)
+        log_marker("READY", "1")
+        step_5_heartbeat()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the cli via marker, not raised
+        log_marker("ERROR", str(exc))
+        raise
+
+
+if __name__ == "__main__":
+    main()
