@@ -75,6 +75,7 @@ v1 is a success if ten other people do the same.
 
 ## docs
 
+- [getting started](docs/getting-started.md) — run phase 0 locally, what to test, what to report back
 - [architecture](docs/architecture.md) — the three planes, the session lifecycle, the proxy, failure modes
 - [tech spec](docs/tech-spec.md) — stack decisions, notebook contract, cli surface, config
 - [roadmap](docs/roadmap.md) — phases, milestones, and what "done" looks like at each step
